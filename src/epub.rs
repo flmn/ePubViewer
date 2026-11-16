@@ -3,15 +3,13 @@
 //! 严格 XML（container.xml / OPF / NCX）用 `roxmltree`；nav.xhtml 与章节正文
 //! 是 HTML，按容错方式扫描，正文原样交给 WebView 渲染。
 
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use nsh_core::prelude::*;
-use roxmltree::Document;
+use roxmltree::{Document, ParsingOptions};
 use zip::ZipArchive;
-
-type Archive = ZipArchive<Cursor<Vec<u8>>>;
 
 /// 一本解析好的书。
 #[derive(Debug, Clone, JsObject)]
@@ -24,16 +22,28 @@ pub struct Book {
     pub toc: Vec<TocEntry>,
 }
 
-/// 一章正文。
+/// 一章的元信息；正文按需用 `Epub.chapter()` 取。
 #[derive(Debug, Clone, JsObject)]
 pub struct Chapter {
     /// 章节在 ZIP 内的路径，用来匹配目录链接。
     pub id: String,
     /// 章节标题。
     pub title: String,
-    /// 清洗后的 HTML 片段，内嵌图片已变成 data URI。
-    pub html: String,
 }
+
+/// 已打开的书：原始字节留在 Rust 侧，章节正文按需取出，
+/// 避免把整本书（含图片）一次性塞给 WebView。
+pub struct Loaded {
+    pub book: Book,
+    bytes: Vec<u8>,
+    chapter_paths: Vec<String>,
+}
+
+/// 每章最多内联多少图片字节，避免章节 HTML 过大。
+const MAX_INLINE_IMAGE_BYTES: usize = 2 * 1024 * 1024;
+
+/// 每章最多内联多少 CSS 字节。
+const MAX_CSS_BYTES: usize = 1024 * 1024;
 
 /// 一个目录项。
 #[derive(Debug, Clone, JsObject)]
@@ -61,7 +71,8 @@ struct RawToc {
     level: u32,
 }
 
-pub fn parse(data: Vec<u8>) -> Result<Book, String> {
+pub fn parse(data: Vec<u8>) -> Result<Loaded, String> {
+    let saved = data.clone();
     let mut archive = ZipArchive::new(Cursor::new(data))
         .map_err(|e| format!("不是有效的 EPUB 文件: {e}"))?;
     let names: Vec<String> = archive
@@ -71,8 +82,8 @@ pub fn parse(data: Vec<u8>) -> Result<Book, String> {
         .collect();
 
     let container = read(&mut archive, &names, "META-INF/container.xml")?;
-    let container_xml = String::from_utf8_lossy(&container);
-    let container = Document::parse(container_xml.as_ref())
+    let container_xml = decode_xml(&container);
+    let container = parse_xml(&container_xml)
         .map_err(|e| format!("container.xml 解析失败: {e}"))?;
     let opf_path = container
         .descendants()
@@ -83,8 +94,8 @@ pub fn parse(data: Vec<u8>) -> Result<Book, String> {
     let opf_dir = dir_of(&opf_path);
 
     let opf_bytes = read(&mut archive, &names, &opf_path)?;
-    let opf_xml = String::from_utf8_lossy(&opf_bytes);
-    let opf = Document::parse(opf_xml.as_ref())
+    let opf_xml = decode_xml(&opf_bytes);
+    let opf = parse_xml(&opf_xml)
         .map_err(|e| format!("OPF 解析失败: {e}"))?;
 
     let title = opf
@@ -120,13 +131,9 @@ pub fn parse(data: Vec<u8>) -> Result<Book, String> {
         let Some(item) = items.iter().find(|i| &i.id == id) else {
             continue;
         };
-        let bytes = read(&mut archive, &names, &item.href).unwrap_or_default();
-        let raw = String::from_utf8_lossy(&bytes);
-        let html = prepare_html(raw.as_ref(), &item.href, &mut archive, &names);
         chapters.push(Chapter {
             id: item.href.clone(),
             title: format!("第 {} 节", chapters.len() + 1),
-            html,
         });
     }
     if chapters.is_empty() {
@@ -177,13 +184,112 @@ pub fn parse(data: Vec<u8>) -> Result<Book, String> {
         }
     }
 
-    Ok(Book { title, chapters, toc })
+    let book = Book { title, chapters, toc };
+    let chapter_paths = book.chapters.iter().map(|c| c.id.clone()).collect();
+    Ok(Loaded {
+        book,
+        bytes: saved,
+        chapter_paths,
+    })
 }
 
-fn prepare_html(raw: &str, chapter_path: &str, archive: &mut Archive, names: &[String]) -> String {
+impl Loaded {
+    /// 取一章的正文 HTML：只内联这一章的图片，并限制总量。
+    pub fn chapter_html(&self, index: u32) -> String {
+        let Some(path) = self.chapter_paths.get(index as usize) else {
+            return String::new();
+        };
+        let Ok(mut archive) = ZipArchive::new(Cursor::new(self.bytes.as_slice())) else {
+            return String::new();
+        };
+        let names: Vec<String> = archive
+            .file_names()
+            .filter_map(|name| name.ok())
+            .map(|name| name.into_owned())
+            .collect();
+        let Ok(bytes) = read(&mut archive, &names, path) else {
+            return String::new();
+        };
+        let raw = decode_xml(&bytes);
+        let mut budget = MAX_INLINE_IMAGE_BYTES;
+        let mut css_budget = MAX_CSS_BYTES;
+        let css = collect_css(raw.as_ref(), path, &mut archive, &names, &mut css_budget);
+        let html = prepare_html(raw.as_ref(), path, &mut archive, &names, &mut budget);
+        // 纯封面/空白页给一个书名页，避免打开书后一片空白。
+        if plain_text(&html).trim().is_empty() {
+            return format!(
+                "<h1>{}</h1><p>从左侧目录选择章节，或按 → 开始阅读。</p>",
+                escape_html(&self.book.title)
+            );
+        }
+        if css.is_empty() {
+            return html;
+        }
+        // 书籍自带样式随正文一起交给 WebView，排在应用兜底样式之后。
+        format!("<style>{css}</style>{html}")
+    }
+}
+
+fn prepare_html<R: Read + Seek>(
+    raw: &str,
+    chapter_path: &str,
+    archive: &mut ZipArchive<R>,
+    names: &[String],
+    budget: &mut usize,
+) -> String {
     let body = extract_body(raw);
     let body = strip_disallowed(&body);
-    inline_images(&body, &dir_of(chapter_path), archive, names)
+    inline_images(&body, &dir_of(chapter_path), archive, names, budget)
+}
+
+/// 收集一章引用的 CSS：按文档顺序拼接 `<link rel="stylesheet">` 指向的
+/// 样式表和 `<style>` 块的内容。`@import` 与字体文件不展开。
+fn collect_css<R: Read + Seek>(
+    raw: &str,
+    chapter_path: &str,
+    archive: &mut ZipArchive<R>,
+    names: &[String],
+    budget: &mut usize,
+) -> String {
+    let base = dir_of(chapter_path);
+    let mut out = String::new();
+    let mut pos = 0;
+    while let Some(start) = find_byte(raw, b'<', pos) {
+        let Some(gt) = find_byte(raw, b'>', start) else { break };
+        let tag = &raw[start..gt + 1];
+        match tag_name(tag).as_str() {
+            "link" => {
+                let rel = attr_range(tag, "rel")
+                    .map(|(a, b)| tag[a..b].to_ascii_lowercase())
+                    .unwrap_or_default();
+                if rel.split([' ', '\t']).any(|t| t == "stylesheet") {
+                    if let Some((a, b)) = attr_range(tag, "href") {
+                        let path = resolve(&base, &percent_decode(&tag[a..b]));
+                        if let Ok(bytes) = read(archive, names, &path) {
+                            if bytes.len() <= *budget {
+                                *budget -= bytes.len();
+                                out.push_str("/* ");
+                                out.push_str(&path);
+                                out.push_str(" */\n");
+                                out.push_str(&String::from_utf8_lossy(&bytes));
+                                out.push('\n');
+                            }
+                        }
+                    }
+                }
+            }
+            "style" => {
+                let close = find_ci(raw, "</style", gt).unwrap_or(raw.len());
+                out.push_str(&raw[gt + 1..close.min(raw.len())]);
+                out.push('\n');
+                pos = find_byte(raw, b'>', close).map_or(raw.len(), |i| i + 1);
+                continue;
+            }
+            _ => {}
+        }
+        pos = gt + 1;
+    }
+    out
 }
 
 fn extract_body(s: &str) -> String {
@@ -225,14 +331,20 @@ fn strip_disallowed(s: &str) -> String {
     out
 }
 
-fn inline_images(s: &str, base: &str, archive: &mut Archive, names: &[String]) -> String {
+fn inline_images<R: Read + Seek>(
+    s: &str,
+    base: &str,
+    archive: &mut ZipArchive<R>,
+    names: &[String],
+    budget: &mut usize,
+) -> String {
     let mut out = String::with_capacity(s.len());
     let mut pos = 0;
     while let Some(start) = find_ci(s, "<img", pos) {
         let Some(gt) = find_byte(s, b'>', start) else { break };
         out.push_str(&s[pos..start]);
         let tag = &s[start..gt + 1];
-        match rewrite_img(tag, base, archive, names) {
+        match rewrite_img(tag, base, archive, names, budget) {
             Some(rewritten) => out.push_str(&rewritten),
             None => out.push_str(tag),
         }
@@ -242,7 +354,13 @@ fn inline_images(s: &str, base: &str, archive: &mut Archive, names: &[String]) -
     out
 }
 
-fn rewrite_img(tag: &str, base: &str, archive: &mut Archive, names: &[String]) -> Option<String> {
+fn rewrite_img<R: Read + Seek>(
+    tag: &str,
+    base: &str,
+    archive: &mut ZipArchive<R>,
+    names: &[String],
+    budget: &mut usize,
+) -> Option<String> {
     let (from, to) = attr_range(tag, "src")?;
     let src = percent_decode(&tag[from..to]);
     if src.is_empty()
@@ -254,6 +372,11 @@ fn rewrite_img(tag: &str, base: &str, archive: &mut Archive, names: &[String]) -
     }
     let path = resolve(base, &src);
     let bytes = read(archive, names, &path).ok()?;
+    if bytes.len() > *budget {
+        // 超出本章预算：丢掉这张图，别让整章 HTML 变成几十 MB。
+        return Some(String::new());
+    }
+    *budget -= bytes.len();
     let uri = format!("data:{};base64,{}", mime_of(&path), STANDARD.encode(&bytes));
     Some(format!("{}{}{}", &tag[..from], uri, &tag[to..]))
 }
@@ -304,7 +427,7 @@ fn parse_ncx(xml: &str, base: &str) -> Vec<RawToc> {
         .replace("&mdash;", "&#8212;")
         .replace("&ndash;", "&#8211;")
         .replace("&hellip;", "&#8230;");
-    let Ok(doc) = Document::parse(&xml) else {
+    let Ok(doc) = parse_xml(&xml) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -371,7 +494,7 @@ fn locate(target: &str, chapters: &[Chapter]) -> (u32, String) {
     (0, anchor.to_owned())
 }
 
-fn read(archive: &mut Archive, names: &[String], path: &str) -> Result<Vec<u8>, String> {
+fn read<R: Read + Seek>(archive: &mut ZipArchive<R>, names: &[String], path: &str) -> Result<Vec<u8>, String> {
     let name = match_name(names, path);
     let mut file = archive
         .by_name(&name)
@@ -422,6 +545,46 @@ fn hex(b: u8) -> Option<u8> {
 
 fn dir_of(path: &str) -> String {
     path.rfind('/').map_or_else(String::new, |i| path[..i].to_owned())
+}
+
+/// 解析严格 XML。EPUB2 的 NCX 几乎都带 DOCTYPE，roxmltree 默认拒绝 DTD，
+/// 这里显式打开 `allow_dtd`；外部 DTD 不会加载，实体仍需提前替换成数字引用。
+fn parse_xml(xml: &str) -> Result<Document<'_>, roxmltree::Error> {
+    Document::parse_with_options(
+        xml,
+        ParsingOptions {
+            allow_dtd: true,
+            ..ParsingOptions::default()
+        },
+    )
+}
+
+/// 优先按 XML 声明的编码解码（EPUB 里偶见 GBK 等），否则按 UTF-8。
+fn decode_xml(bytes: &[u8]) -> String {
+    let head = String::from_utf8_lossy(&bytes[..bytes.len().min(256)]);
+    let enc = head
+        .split("encoding=\"")
+        .nth(1)
+        .or_else(|| head.split("encoding='").nth(1))
+        .and_then(|rest| rest.split(['"', '\'']).next())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if !enc.is_empty() && enc != "utf-8" && enc != "utf8" {
+        if let Some(encoding) = encoding_rs::Encoding::for_label(enc.as_bytes()) {
+            let (text, _, had_errors) = encoding.decode(bytes);
+            if !had_errors {
+                return text.into_owned();
+            }
+        }
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn resolve(base: &str, href: &str) -> String {
@@ -594,7 +757,7 @@ mod tests {
         add(
             &mut w,
             "OEBPS/toc.ncx",
-            r#"<?xml version="1.0"?><ncx xmlns="http://www.daisy.org/z3986/2005/ncx/"><navMap><navPoint id="n1"><navLabel><text>第一章</text></navLabel><content src="ch1.xhtml"/></navPoint><navPoint id="n2"><navLabel><text>第二章</text></navLabel><content src="ch2.xhtml"/><navPoint id="n3"><navLabel><text>小节</text></navLabel><content src="ch2.xhtml#sec2"/></navPoint></navPoint></navMap></ncx>"#.as_bytes(),
+            r#"<?xml version="1.0"?><!DOCTYPE ncx PUBLIC "-//NISO//DTD ncx 2005-1//EN" "http://www.daisy.org/z3986/2005/ncx-2005-1.dtd"><ncx xmlns="http://www.daisy.org/z3986/2005/ncx/"><navMap><navPoint id="n1"><navLabel><text>第一章</text></navLabel><content src="ch1.xhtml"/></navPoint><navPoint id="n2"><navLabel><text>第二章</text></navLabel><content src="ch2.xhtml"/><navPoint id="n3"><navLabel><text>小节</text></navLabel><content src="ch2.xhtml#sec2"/></navPoint></navPoint></navMap></ncx>"#.as_bytes(),
         );
         if epub3 {
             add(
@@ -605,8 +768,13 @@ mod tests {
         }
         add(
             &mut w,
+            "OEBPS/style.css",
+            b"p { margin: 0 0 .4em; } .lead { font-weight: bold; }",
+        );
+        add(
+            &mut w,
             "OEBPS/ch1.xhtml",
-            r#"<html><head><link rel="stylesheet" href="style.css"/></head><body><h1>第一章</h1><p>你好，世界。</p><img src="images/cover.png" alt="封面"/><script>bad()</script></body></html>"#.as_bytes(),
+            r#"<html><head><link rel="stylesheet" href="style.css"/><style>.note { color: #666; }</style></head><body><h1>第一章</h1><p class="lead">你好，世界。</p><img src="images/cover.png" alt="封面"/><script>bad()</script></body></html>"#.as_bytes(),
         );
         add(
             &mut w,
@@ -619,7 +787,7 @@ mod tests {
 
     #[test]
     fn parses_epub2_ncx() {
-        let book = parse(sample(false)).unwrap();
+        let book = parse(sample(false)).unwrap().book;
         assert_eq!(book.title, "测试书");
         assert_eq!(book.chapters.len(), 2);
         assert_eq!(book.toc.len(), 3);
@@ -634,21 +802,26 @@ mod tests {
 
     #[test]
     fn parses_epub3_nav() {
-        let book = parse(sample(true)).unwrap();
+        let book = parse(sample(true)).unwrap().book;
         assert_eq!(book.toc.len(), 3);
         assert_eq!(book.toc[2].anchor, "sec2");
         assert_eq!(book.toc[2].level, 1);
     }
 
     #[test]
-    fn cleans_chapter_html_and_inlines_images() {
-        let book = parse(sample(false)).unwrap();
-        let html = &book.chapters[0].html;
+    fn chapter_html_is_loaded_on_demand() {
+        let loaded = parse(sample(false)).unwrap();
+        let html = loaded.chapter_html(0);
         assert!(html.contains("你好，世界。"));
         assert!(html.contains("data:image/png;base64,"));
         assert!(!html.contains("<script"));
         assert!(!html.contains("<link"));
         assert!(!html.contains("<body"));
+        // 外链样式表与内联 <style> 都被收集进 <style> 注入。
+        assert!(html.contains("/* OEBPS/style.css */"));
+        assert!(html.contains("font-weight: bold"));
+        assert!(html.contains(".note { color: #666; }"));
+        assert!(loaded.chapter_html(1).contains("第二章正文"));
     }
 
     #[test]
@@ -657,4 +830,14 @@ mod tests {
         assert_eq!(percent_decode("a%20b.xhtml"), "a b.xhtml");
         assert_eq!(tag_name("</OL>"), "/ol");
     }
+
+    #[test]
+    fn decodes_declared_encoding() {
+        let (gbk, _, _) = encoding_rs::GBK.encode("测试书");
+        let mut bytes = b"<?xml version=\"1.0\" encoding=\"gbk\"?><title>".to_vec();
+        bytes.extend_from_slice(gbk.as_ref());
+        bytes.extend_from_slice(b"</title>");
+        assert!(decode_xml(&bytes).contains("测试书"));
+    }
+
 }

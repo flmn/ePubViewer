@@ -580,6 +580,7 @@ name = "epubviewer"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
+ "encoding_rs",
  "nsh-base",
  "nsh-core",
  "roxmltree",

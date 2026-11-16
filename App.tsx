@@ -12,18 +12,20 @@ type Pending = { chapter: number; anchor: string } | null;
 
 let web: WebHandle | null = null;
 let reportedFor = -1;
+let docStamp = 0;
 const book = signal<Book | null>(null);
+// 只保存当前这一章的正文：每次加载给一个新 stamp，强制 WebView 重新排版。
+const chapterDoc = signal<{ html: string; stamp: number }>({ html: "", stamp: 0 });
 const chapterIndex = signal(0);
 const page = signal(0);
 const totalPages = signal(1);
-const showToc = signal(true);
+const showToc = signal(false);
 const busy = signal(false);
 const error = signal<string | null>(null);
-const reload = signal(0);
 const pending = signal<Pending>(null);
 
 // 把章节 HTML 包成「一页一张纸」：CSS 多列把整章排成若干列，
-/// 每列正好一页，translateX 切到第 n 列。页数由页内脚本算好后上报。
+// 每列正好一页，translateX 切到第 n 列。页数由页内脚本算好后上报。
 function pageHtml(body: string, stamp: number): string {
   return `<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -34,12 +36,13 @@ function pageHtml(body: string, stamp: number): string {
     font-size:18px; line-height:1.85; }
   #viewport { position:fixed; inset:44px 56px; overflow:hidden; }
   #content { height:100%; column-gap:0; column-fill:auto; transform:translateX(0); }
-  #content p { margin:0 0 1em; text-align:justify; }
-  #content h1,#content h2,#content h3 { line-height:1.4; margin:1.2em 0 .6em; }
+  /* 兜底文本样式用 :where 降为 0 特异性，书籍自带 CSS 可直接覆盖 */
+  #content :where(p) { margin:0 0 1em; text-align:justify; }
+  #content :where(h1,h2,h3,h4,h5,h6) { line-height:1.4; margin:1.2em 0 .6em; }
   #content img { max-width:100%; height:auto; }
-  #content a { color:#8a6a3a; text-decoration:none; }
-  #content blockquote { margin:1em 0; padding-left:1em; border-left:3px solid #ddd8cc; }
-  #content pre { white-space:pre-wrap; }
+  #content :where(a) { color:#8a6a3a; text-decoration:none; }
+  #content :where(blockquote) { margin:1em 0; padding-left:1em; border-left:3px solid #ddd8cc; }
+  #content :where(pre) { white-space:pre-wrap; }
 </style></head><body>
 <div id="viewport"><div id="content">${body}</div></div>
 <!-- ${stamp} -->
@@ -48,7 +51,14 @@ function pageHtml(body: string, stamp: number): string {
   var viewport=document.getElementById('viewport');
   var content=document.getElementById('content');
   var width=1,total=1,current=0;
-  function post(msg){ if(window.nsh&&window.nsh.postMessage) window.nsh.postMessage(JSON.stringify(msg)); }
+  var lastPost='';
+  function post(msg){
+    if(!window.nsh||!window.nsh.postMessage) return;
+    var s=JSON.stringify(msg);
+    if(s===lastPost) return;
+    lastPost=s;
+    window.nsh.postMessage(s);
+  }
   function setPage(n,report){
     current=Math.max(0,Math.min(n,total-1));
     content.style.transform='translateX('+(-current*width)+'px)';
@@ -102,13 +112,22 @@ function chapter() {
   return book()?.chapters[chapterIndex()];
 }
 
+async function loadChapter(index: number) {
+  try {
+    const html = await Epub.chapter(index);
+    chapterDoc.set({ html, stamp: ++docStamp });
+  } catch (e) {
+    error.set(String(e));
+  }
+}
+
 function adopt(next: Book) {
   book.set(next);
   chapterIndex.set(0);
   page.set(0);
   totalPages.set(1);
   pending.set({ chapter: 0, anchor: "" });
-  reload.update((n) => n + 1);
+  void loadChapter(0);
 }
 
 async function openBook() {
@@ -144,10 +163,11 @@ function go(n: number) {
 }
 
 function jump(entry: TocEntry) {
+  showToc.set(false);
   chapterIndex.set(entry.chapter);
   page.set(0);
   pending.set({ chapter: entry.chapter, anchor: entry.anchor });
-  reload.update((n) => n + 1);
+  void loadChapter(entry.chapter);
 }
 
 function jumpHref(href: string) {
@@ -170,7 +190,7 @@ function jumpHref(href: string) {
   chapterIndex.set(index);
   page.set(0);
   pending.set({ chapter: index, anchor });
-  reload.update((n) => n + 1);
+  void loadChapter(index);
 }
 
 function onMessage(data: string) {
@@ -182,7 +202,7 @@ function onMessage(data: string) {
   }
   if (msg.type === "ready") {
     totalPages.set(Math.max(1, msg.total ?? 1));
-    const stamp = reload();
+    const stamp = chapterDoc().stamp;
     if (reportedFor === stamp) return;
     reportedFor = stamp;
     const target = pending();
@@ -211,7 +231,9 @@ function App() {
       pageup: () => go(page() - 1),
       pagedown: () => go(page() + 1),
       "mod+o": () => void openBook(),
-      "mod+t": () => showToc.update((v) => !v),
+      "mod+t": () => {
+        if (book()) showToc.update((v) => !v);
+      },
     },
     { when: "always" },
   );
@@ -224,36 +246,6 @@ function App() {
         if (uri) void openDropped(uri);
       }}
     >
-      {showToc() ? (
-        <View
-          style={{
-            width: 268,
-            backgroundColor: "#f7f6f2",
-            borderRightWidth: 1,
-            borderColor: "#dedbd2",
-          }}
-        >
-          <View style={{ padding: 18, paddingBottom: 10 }}>
-            <Text style={{ fontSize: 13, color: "#8a887f" }}>目录</Text>
-          </View>
-          <List each={book()?.toc ?? []} style={{ flex: 1 }} keyExtractor={(item) => item.label}>
-            {(item) => (
-              <Button
-                onPress={() => jump(item())}
-                style={{
-                  paddingLeft: 16 + item().level * 14,
-                  paddingRight: 16,
-                  paddingTop: 7,
-                  paddingBottom: 7,
-                }}
-              >
-                <Text style={{ fontSize: 13, color: "#3b3a35" }}>{item().label}</Text>
-              </Button>
-            )}
-          </List>
-        </View>
-      ) : null}
-
       <View style={{ flex: 1, flexDirection: "column" }}>
         <View
           style={{
@@ -283,17 +275,26 @@ function App() {
               {busy() ? "打开中…" : "打开 EPUB"}
             </Text>
           </Button>
-          <Button
-            onPress={() => showToc.update((v) => !v)}
-            style={{ paddingLeft: 10, paddingRight: 10, paddingTop: 8, paddingBottom: 8 }}
-          >
-            <Text style={{ fontSize: 13, color: "#5a5851" }}>目录</Text>
-          </Button>
           <Text style={{ flex: 1, fontSize: 14, color: "#2f2e2b" }}>
             {book() ? book()!.title : "尚未打开文件"}
           </Text>
           {error() ? <Text style={{ fontSize: 12, color: "#b23b3b" }}>{error()}</Text> : null}
           <Text style={{ fontSize: 12, color: "#8a887f" }}>{chapter()?.title ?? ""}</Text>
+          <Button
+            onPress={() => {
+              if (book()) showToc.update((v) => !v);
+            }}
+            style={{
+              paddingLeft: 12,
+              paddingRight: 12,
+              paddingTop: 8,
+              paddingBottom: 8,
+              borderRadius: 8,
+              backgroundColor: showToc() ? "#e6e2d4" : undefined,
+            }}
+          >
+            <Text style={{ fontSize: 13, color: "#5a5851" }}>目录</Text>
+          </Button>
         </View>
 
         <View style={{ flex: 1, padding: 22 }}>
@@ -302,7 +303,11 @@ function App() {
               ref={(node) => {
                 web = node;
               }}
-              html={chapter() ? pageHtml(chapter()!.html, reload()) : welcomeHtml()}
+              html={
+                chapterDoc().html
+                  ? pageHtml(chapterDoc().html, chapterDoc().stamp)
+                  : welcomeHtml()
+              }
               scrollable={false}
               style={{ flex: 1 }}
               onLoad={() => {
@@ -355,6 +360,78 @@ function App() {
           </Text>
         </View>
       </View>
+
+      {showToc() ? (
+        <View
+          style={{ position: "absolute", left: 0, right: 0, top: 0, bottom: 0 }}
+          onPress={() => showToc.set(false)}
+        />
+      ) : null}
+      {showToc() ? (
+        <View
+          style={{
+            position: "absolute",
+            top: 58,
+            right: 12,
+            width: 320,
+            height: 600,
+            flexDirection: "column",
+            backgroundColor: "#f7f6f2",
+            borderRadius: 10,
+            borderWidth: 1,
+            borderColor: "#dedbd2",
+            overflow: "hidden",
+          }}
+        >
+          <View
+            style={{
+              paddingLeft: 16,
+              paddingRight: 16,
+              paddingTop: 12,
+              paddingBottom: 6,
+              flexDirection: "row",
+            }}
+          >
+            <Text style={{ flex: 1, fontSize: 12, color: "#8a887f" }}>目录</Text>
+            <Text style={{ fontSize: 12, color: "#a5a29a" }}>{`${book()?.toc.length ?? 0} 项`}</Text>
+          </View>
+          <List
+            each={book()?.toc ?? []}
+            style={{ flex: 1, paddingBottom: 8 }}
+            empty={
+              <View style={{ padding: 16 }}>
+                <Text style={{ fontSize: 13, color: "#8a887f" }}>这本书没有目录条目</Text>
+              </View>
+            }
+          >
+            {(item) => {
+              const current = item().chapter === chapterIndex();
+              return (
+                <Button
+                  onPress={() => jump(item())}
+                  style={{
+                    paddingLeft: 16 + item().level * 14,
+                    paddingRight: 16,
+                    paddingTop: 7,
+                    paddingBottom: 7,
+                    backgroundColor: current ? "#e6e2d4" : undefined,
+                  }}
+                >
+                  <Text
+                    style={{
+                      fontSize: 13,
+                      fontWeight: current ? "bold" : "normal",
+                      color: current ? "#1f1e1b" : "#3b3a35",
+                    }}
+                  >
+                    {item().label}
+                  </Text>
+                </Button>
+              );
+            }}
+          </List>
+        </View>
+      ) : null}
     </View>
   );
 }

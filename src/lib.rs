@@ -4,14 +4,25 @@
 mod epub;
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use nsh_base as _;
 use nsh_core::file_dialog::{FileFilter, OpenDialog};
 use nsh_core::prelude::*;
 
+/// 当前打开的书。章节正文按需从这里取，避免把整本书一次传给 WebView。
+static LOADED: OnceLock<Mutex<Option<Arc<epub::Loaded>>>> = OnceLock::new();
+
 #[native_module("epubviewer/native")]
 fn native(registry: &mut Registry) {
     registry.module::<Epub>();
+}
+
+fn store(loaded: epub::Loaded) -> epub::Book {
+    let book = loaded.book.clone();
+    let lock = LOADED.get_or_init(|| Mutex::new(None));
+    *lock.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(loaded));
+    book
 }
 
 /// EPUB 文件的解析入口。
@@ -39,6 +50,17 @@ impl Epub {
     pub async fn parse(bytes: Vec<u8>) -> Result<epub::Book, String> {
         parse_bytes(bytes).await
     }
+
+    /// 取指定章节的正文 HTML；只传这一章，WebView 才装得下。
+    pub async fn chapter(index: u32) -> Result<String, String> {
+        let loaded = LOADED
+            .get()
+            .and_then(|lock| lock.lock().unwrap_or_else(|e| e.into_inner()).clone())
+            .ok_or_else(|| "还没有打开任何 EPUB".to_owned())?;
+        blocking(move || loaded.chapter_html(index))
+            .await
+            .map_err(|e| format!("读取章节失败: {e}"))
+    }
 }
 
 async fn parse_at(path: PathBuf) -> Result<epub::Book, String> {
@@ -51,7 +73,8 @@ async fn parse_at(path: PathBuf) -> Result<epub::Book, String> {
 }
 
 async fn parse_bytes(bytes: Vec<u8>) -> Result<epub::Book, String> {
-    blocking(move || epub::parse(bytes))
+    let loaded = blocking(move || epub::parse(bytes))
         .await
-        .map_err(|e| format!("解析任务失败: {e}"))?
+        .map_err(|e| format!("解析任务失败: {e}"))??;
+    Ok(store(loaded))
 }
