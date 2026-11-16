@@ -1,89 +1,57 @@
-//! The app's Rust code: what `App.tsx` imports from `epubviewer/native`. Their
-//! TypeScript declarations are generated from these types into
-//! `.nsh/types/epubviewer/native.d.ts`.
+//! ePubViewer 的 Rust 侧：`App.tsx` 从 `epubviewer/native` 导入这里的 `Epub`
+//! 模块，以及由 `#[derive(JsObject)]` 生成的 `Book` / `Chapter` / `TocEntry`。
 
-use nsh_base::theme;
+mod epub;
+
+use std::path::PathBuf;
+
+use nsh_base as _;
+use nsh_core::file_dialog::{FileFilter, OpenDialog};
 use nsh_core::prelude::*;
 
-/// The crate's UI set (`nsh.json` `"rust"`).
 #[native_module("epubviewer/native")]
 fn native(registry: &mut Registry) {
-    registry
-        .register::<Badge>()
-        .module::<Format>()
-        .class::<Counter>();
+    registry.module::<Epub>();
 }
 
-// A component: `<Badge label="…" onPress={…} />`. The function's doc comment
-// is the component's in TS, the fields' its props'.
-/// The props of [`Badge`].
-#[derive(Debug, Clone, PartialEq, Props)]
-pub struct BadgeProps {
-    /// The text.
-    pub label: Prop<SharedString>,
-}
-
-/// The events of a [`Badge`].
-#[derive(Debug, Clone, PartialEq, Event)]
-pub enum BadgeEvent {
-    /// The badge was pressed.
-    Press,
-}
-
-/// A pill with a label; pressing it reports `onPress`.
-#[component]
-pub fn Badge(props: BadgeProps, cx: Scope<BadgeEvent>) -> impl IntoElement {
-    view()
-        .px_4()
-        .py_2()
-        .rounded_full()
-        .bg(move || theme().primary)
-        .active(|s| s.bg(move || theme().primary.opacity(0.9)))
-        .on_press(move || cx.emit(BadgeEvent::Press))
-        .child(text(props.label).text_color(move || theme().primary_foreground))
-}
-
-/// Text helpers.
+/// EPUB 文件的解析入口。
 #[module]
-pub struct Format;
+pub struct Epub;
 
-// A module: `Format.times(3)`. The struct's doc comment is the module's in
-// TS (`#[module]` on it and on this block).
 #[module]
-impl Format {
-    /// "once", "twice", "3 times".
-    pub fn times(count: u32) -> String {
-        match count {
-            1 => "once".to_owned(),
-            2 => "twice".to_owned(),
-            n => format!("{n} times"),
-        }
+impl Epub {
+    /// 弹出系统文件对话框，读取并解析一本 EPUB；取消时返回 null。
+    pub async fn open() -> Result<Option<epub::Book>, String> {
+        let paths = pick_paths(OpenDialog::files().filter(FileFilter::new("EPUB", ["epub"]))).await?;
+        let Some(path) = paths.and_then(|picked| picked.into_iter().next()) else {
+            return Ok(None);
+        };
+        parse_at(path).await.map(Some)
+    }
+
+    /// 打开一个本地路径（把文件拖到窗口时使用，也接受 `file://` URL）。
+    pub async fn load(path: String) -> Result<epub::Book, String> {
+        let path = path.strip_prefix("file://").unwrap_or(&path);
+        parse_at(PathBuf::from(epub::percent_decode(path))).await
+    }
+
+    /// 解析 EPUB 文件的字节。
+    pub async fn parse(bytes: Vec<u8>) -> Result<epub::Book, String> {
+        parse_bytes(bytes).await
     }
 }
 
-/// A count kept in Rust.
-#[class]
-pub struct Counter {
-    count: u32,
+async fn parse_at(path: PathBuf) -> Result<epub::Book, String> {
+    let bytes = blocking(move || {
+        std::fs::read(&path).map_err(|e| format!("无法读取 {}: {e}", path.display()))
+    })
+    .await
+    .map_err(|e| format!("读取任务失败: {e}"))??;
+    parse_bytes(bytes).await
 }
 
-// A class: `new Counter()`, `counter.increment()`, `counter.count`.
-#[class]
-impl Counter {
-    /// A counter at 0.
-    pub fn new() -> Self {
-        Counter { count: 0 }
-    }
-
-    /// Adds one; the new count.
-    pub fn increment(&mut self) -> u32 {
-        self.count += 1;
-        self.count
-    }
-
-    /// The count.
-    #[getter]
-    pub fn count(&self) -> u32 {
-        self.count
-    }
+async fn parse_bytes(bytes: Vec<u8>) -> Result<epub::Book, String> {
+    blocking(move || epub::parse(bytes))
+        .await
+        .map_err(|e| format!("解析任务失败: {e}"))?
 }

@@ -9,3 +9,6 @@ publish = false
 [dependencies]
 nsh-core = "0.5.1"
 nsh-base = "0.5.1"
+zip = "9.6.0"
+roxmltree = "0.21"
+base64 = "0.23"
