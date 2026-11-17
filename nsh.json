@@ -18,12 +18,12 @@
       }
     },
     "defaultSize": {
-      "width": 960,
-      "height": 720
+      "width": 760,
+      "height": 1040
     },
     "minSize": {
-      "width": 640,
-      "height": 420
+      "width": 540,
+      "height": 680
     }
   },
   "theme": {

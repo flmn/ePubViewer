@@ -543,6 +543,21 @@ mod tests {
     }
 
     #[test]
+    fn page_script_keeps_turning_hooks() {
+        let html = parse(sample(false)).unwrap().book_html(&BookTheme::default());
+        // 宿主驱动分页的入口：翻屏、跳到某页、重排、单页/对开。
+        assert!(html.contains("__epubTurn"));
+        assert!(html.contains("__epubSetPage"));
+        assert!(html.contains("__epubLayout"));
+        assert!(html.contains("__epubSpread"));
+        // 触控板/滚轮手势与翻页过渡。`will-change` 跟着一起掉了的话，
+        // 翻页会退化成每帧重绘几千列（对开时实测 60fps → 12fps）。
+        assert!(html.contains("addEventListener('wheel'"));
+        assert!(html.contains("transition:transform"));
+        assert!(html.contains("will-change:transform"));
+    }
+
+    #[test]
     fn parses_epub2_ncx() {
         let book = parse(sample(false)).unwrap().book;
         assert_eq!(book.title, "测试书");

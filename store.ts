@@ -46,6 +46,8 @@ export const fontSize = signal(DEFAULT_FONT_SIZE);
 export const fontDefault = computed(() => fontSize() === DEFAULT_FONT_SIZE);
 /** 当前是否深色外观：固定模式优先，`system` 跟随系统。 */
 export const darkMode = computed(() => colorScheme() === "dark");
+/** 是否双页对开：阅读区够宽（宽高比够大）时左右并排两页，否则一屏一页。 */
+export const spread = signal(false);
 
 const EMPTY_TOC: TocEntry[] = [];
 
@@ -155,9 +157,11 @@ export function go(n: number) {
   inject(`window.__epubSetPage && window.__epubSetPage(${target})`);
 }
 
-/** 翻 `delta` 页；到全书首尾为止。 */
+/** 翻 `delta` 屏：单页时是一页，对开时一次两页；由页内脚本按自己的
+ *  当前屏来推进，省得两边的页码在翻页途中对不上。 */
 export function turn(delta: number) {
-  go(page() + delta);
+  if (!book()) return;
+  inject(`window.__epubTurn && window.__epubTurn(${delta})`);
 }
 
 /** 跳到目录项：章节开头是 `ch{i}`，章内锚点是 `ch{i}-{anchor}`。 */
@@ -179,13 +183,14 @@ export function loadDocument() {
   applyDocumentTheme();
 }
 
-/** 把外观与字号推给已经打开的文档，并重新分页。 */
+/** 把外观、字号与单页/对开推给已经打开的文档，并重新分页。 */
 export function applyDocumentTheme() {
   const vars = JSON.stringify(docVars());
   inject(
     `(function(){var r=document.documentElement,v=${vars};` +
       `r.classList.toggle('dark',${darkMode()});` +
       `for(var k in v)r.style.setProperty(k,v[k]);` +
+      `window.__epubSpread&&window.__epubSpread(${spread()});` +
       `window.__epubLayout&&window.__epubLayout();})()`,
   );
 }

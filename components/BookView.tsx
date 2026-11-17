@@ -28,7 +28,8 @@ function welcomeHtml(): string {
 <style>
   html,body { margin:0; height:100%; background:${token("card")}; color:${token("foreground")};
     font-family:-apple-system,"PingFang SC","Songti SC",serif; font-size:16px; line-height:1.8; }
-  main { padding:56px; }
+  /* 窗口很宽时（对开）也别把说明文字拉成一整行 */
+  main { padding:56px; max-width:520px; }
   h1 { font-size:20px; margin:0 0 12px; }
   p { margin:0 0 8px; color:${token("muted-foreground")}; }
 </style></head><body><main>

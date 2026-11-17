@@ -153,8 +153,13 @@ const BOOK_STYLE: &str = r#"</title><style>
     font-family:-apple-system,"PingFang SC","Songti SC",serif;
     font-size:var(--font-size,18px); line-height:1.85; }
   #viewport { position:fixed; inset:44px 56px; overflow:hidden; }
+  /* 翻页靠平移 #content：给 transform 加过渡就成了滑动翻页。
+     will-change 不能省：全书是几千列宽的一整块，不提升成合成层的话，
+     每帧都要重绘这块上千列的内容——对开时实测掉到 12fps，加上就回到 60fps。 */
   #content { position:relative; height:100%; column-gap:0; column-fill:auto;
-    transform:translateX(0); }
+    transform:translateX(0); will-change:transform;
+    transition:transform 200ms cubic-bezier(.22,.61,.36,1); }
+  @media (prefers-reduced-motion: reduce) { #content { transition:none; } }
   .epub-chapter { display:block; }
   /* 兜底文本样式整体放进 :where()（0 特异性），书籍的 .calibreN 等类规则可直接覆盖 */
   :where(#content p) { margin:0 0 1em; text-align:justify; }
@@ -197,9 +202,15 @@ const BOOK_SCRIPT: &str = r#"</div></div>
   var viewport=document.getElementById('viewport');
   var content=document.getElementById('content');
   var sections=content.querySelectorAll('section.epub-chapter');
-  var width=1,total=1,current=0;
+  /* `current` 是“屏”的下标（一屏一页或一屏两页），`columns` 是全书页数。
+     对宿主的协议统一用“物理页”：翻一屏 = 前进 per() 页。 */
+  var width=1,total=1,current=0,columns=1;
+  /* 对开模式：一屏放两列，中间留一条中缝；单页模式下 gap 为 0。 */
+  var spread=false,gap=0;
   var lastPost='';
   var resEls={};
+  function per(){ return spread?2:1; }
+  function stride(){ return width+gap; }
   function post(msg){
     if(!window.nsh||!window.nsh.postMessage) return;
     var s=JSON.stringify(msg);
@@ -214,30 +225,56 @@ const BOOK_SCRIPT: &str = r#"</div></div>
     }
     return best;
   }
-  function setPage(n,report){
+  /* `animate` 为 false 时不播过渡：跳章、换排版这类大跨度位移直接落位，
+     只有相邻翻页才滑动。 */
+  function setPage(n,report,animate){
     current=Math.max(0,Math.min(n,total-1));
-    content.style.transform='translateX('+(-current*width)+'px)';
-    if(report) post({type:'page',page:current,total:total,chapter:chapterAt(current*width)});
+    var still=animate===false;
+    if(still) content.style.transition='none';
+    content.style.transform='translateX('+(-current*stride()*per())+'px)';
+    if(still){ void content.offsetWidth; content.style.transition=''; }
+    if(report){
+      post({type:'page',page:current*per(),total:columns,chapter:chapterAt(current*stride()*per())});
+    }
+  }
+  /* 换列宽之前记住读者正看着的那一行（页面左上角下的元素），
+     重排后再按它定位，单页/对开切换与窗口缩放都不会跳走。 */
+  function anchorAt(){
+    if(!document.caretRangeFromPoint) return null;
+    var box=viewport.getBoundingClientRect();
+    var range=document.caretRangeFromPoint(box.left+4,box.top+4);
+    var node=range&&range.startContainer;
+    var el=node?(node.nodeType===1?node:node.parentElement):null;
+    return el&&content.contains(el)?el:null;
   }
   function layout(){
-    width=Math.max(1,viewport.clientWidth);
-    content.style.width=width+'px';
+    var p=per();
+    var keep=anchorAt();
+    gap=p===2?96:0;
+    width=Math.max(1,Math.floor((viewport.clientWidth-gap)/p));
+    content.style.columnGap=gap+'px';
     content.style.columnWidth=width+'px';
+    content.style.width=(width*p+gap)+'px';
     content.style.height=viewport.clientHeight+'px';
     content.style.setProperty('--page-height',viewport.clientHeight+'px');
-    total=Math.max(1,Math.ceil((content.scrollWidth-1)/width));
+    /* 带中缝时总宽度是 n*width+(n-1)*gap，先折算回列数 */
+    columns=Math.max(1,Math.round((content.scrollWidth+gap)/stride()));
+    total=Math.max(1,Math.ceil(columns/p));
+    if(keep) current=Math.min(total-1,Math.floor(columnOf(keep)/p));
     if(current>total-1) current=total-1;
-    setPage(current,false);
-    post({type:'ready',total:total,page:current,chapter:chapterAt(current*width)});
+    setPage(current,false,false);
+    post({type:'ready',total:columns,page:current*p,chapter:chapterAt(current*stride()*p)});
   }
-  /* 元素落在第几页：量位置时先把 translateX 归零，
+  /* 元素落在第几列（物理页）：量位置时先把 translateX 归零（过渡也停掉），
      否则两侧都带着翻页位移，算出来的页码会跟着当前页漂。 */
-  function pageOf(el){
-    var t=content.style.transform;
+  function columnOf(el){
+    var t=content.style.transform,tr=content.style.transition;
+    content.style.transition='none';
     content.style.transform='translateX(0)';
     var left=el.getBoundingClientRect().left-content.getBoundingClientRect().left;
     content.style.transform=t;
-    return Math.max(0,Math.floor(left/width));
+    content.style.transition=tr;
+    return Math.max(0,Math.floor(left/stride()));
   }
   /* 找不到锚点时退到它所属的章（`ch3-x` → 第 3 章开头）。Calibre 这类
      工具生成的目录，锚点常挂在被剥掉的 <body id> 上，这类目标本来
@@ -247,17 +284,34 @@ const BOOK_SCRIPT: &str = r#"</div></div>
     if(!el){
       var m=/^ch(\d+)/.exec(id||'');
       el=m?sections[+m[1]]:null;
-      if(!el){ setPage(0,true); return; }
+      if(!el){ setPage(0,true,false); return; }
     }
-    setPage(pageOf(el),true);
+    setPage(Math.floor(columnOf(el)/per()),true,false);
   }
-  window.__epubSetPage=function(n){ setPage(n,true); };
+  /* 宿主翻屏：`delta` 是屏数（对开时一屏两页）。相邻一屏才滑动，
+     跨多屏（跳进度）直接落位。 */
+  window.__epubTurn=function(delta){
+    if(!delta) return;
+    setPage(current+delta,true,true);
+  };
+  /* 宿主指定物理页：落到它所在的那一屏 */
+  window.__epubSetPage=function(n){
+    var next=Math.max(0,Math.min(Math.floor(n/per()),total-1));
+    setPage(next,true,Math.abs(next-current)===1);
+  };
   window.__epubLayout=layout;
   window.__epubGoToAnchor=goAnchor;
+  /* 对开开关只记状态，重新排版由随后的 __epubLayout() 做 */
+  /* 纸张变宽/变窄是宿主下一帧的事：先记下模式，等一帧再排一次，
+     免得用旧宽度算出的列宽留在屏幕上。 */
+  window.__epubSpread=function(v){
+    spread=!!v;
+    setTimeout(layout,0);
+  };
   window.__epubGoToChapter=function(i){
     var el=sections[i];
     if(!el) return;
-    setPage(pageOf(el),true);
+    setPage(Math.floor(columnOf(el)/per()),true,false);
   };
   /* 宿主把 epub:// 换成 data: URL 后填回原属性 */
   window.__epubRes=function(id,data){
@@ -279,7 +333,27 @@ const BOOK_SCRIPT: &str = r#"</div></div>
     if(href.charAt(0)==='#') goAnchor(href.slice(1));
     else post({type:'link',href:href});
   });
+  /* 触控板横扫、鼠标滚轮翻页：横向与纵向取占优的那个方向累积，
+     够一页才翻；翻完短暂静默，免得惯性滚动一次翻过好几页。 */
+  var wheelAcc=0,wheelLock=0;
+  document.addEventListener('wheel',function(e){
+    var d=Math.abs(e.deltaX)>Math.abs(e.deltaY)?e.deltaX:e.deltaY;
+    if(!d) return;
+    e.preventDefault();
+    var now=window.performance&&performance.now?performance.now():Date.now();
+    if(now<wheelLock) return;
+    if(d*wheelAcc<0) wheelAcc=0;
+    wheelAcc+=d;
+    if(Math.abs(wheelAcc)<50) return;
+    var dir=wheelAcc>0?1:-1;
+    wheelAcc=0;
+    wheelLock=now+320;
+    setPage(current+dir,true);
+  },{passive:false});
   content.addEventListener('load',function(){ layout(); },true);
+  /* 排版跟着 #viewport 的真实尺寸走：宿主换纸张宽度（单页 ↔ 对开）时
+     视图尺寸变了就必须重排，不能指望 window 的 resize 一定送到。 */
+  if(window.ResizeObserver){ new ResizeObserver(function(){ layout(); }).observe(viewport); }
   window.addEventListener('resize',layout);
   window.addEventListener('load',function(){ setTimeout(layout,0); });
   setTimeout(layout,0);
