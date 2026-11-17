@@ -230,14 +230,25 @@ const BOOK_SCRIPT: &str = r#"</div></div>
     setPage(current,false);
     post({type:'ready',total:total,page:current,chapter:chapterAt(current*width)});
   }
-  /* 元素落在第几页：列的排布不随 translateX 变化，换算回绝对位置 */
+  /* 元素落在第几页：量位置时先把 translateX 归零，
+     否则两侧都带着翻页位移，算出来的页码会跟着当前页漂。 */
   function pageOf(el){
-    var left=el.getBoundingClientRect().left-content.getBoundingClientRect().left+current*width;
+    var t=content.style.transform;
+    content.style.transform='translateX(0)';
+    var left=el.getBoundingClientRect().left-content.getBoundingClientRect().left;
+    content.style.transform=t;
     return Math.max(0,Math.floor(left/width));
   }
+  /* 找不到锚点时退到它所属的章（`ch3-x` → 第 3 章开头）。Calibre 这类
+     工具生成的目录，锚点常挂在被剥掉的 <body id> 上，这类目标本来
+     就是章首；直接退回全书第一页会让整本目录都点不动。 */
   function goAnchor(id){
     var el=id?document.getElementById(id):null;
-    if(!el){ setPage(0,true); return; }
+    if(!el){
+      var m=/^ch(\d+)/.exec(id||'');
+      el=m?sections[+m[1]]:null;
+      if(!el){ setPage(0,true); return; }
+    }
     setPage(pageOf(el),true);
   }
   window.__epubSetPage=function(n){ setPage(n,true); };
