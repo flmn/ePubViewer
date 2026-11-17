@@ -10,7 +10,7 @@ use nsh_base as _;
 use nsh_core::file_dialog::{FileFilter, OpenDialog};
 use nsh_core::prelude::*;
 
-/// 当前打开的书。章节正文按需从这里取，避免把整本书一次传给 WebView。
+/// 当前打开的书。原始字节留在这里：整书文档按需拼装，资源按需取字节。
 static LOADED: OnceLock<Mutex<Option<Arc<epub::Loaded>>>> = OnceLock::new();
 
 #[native_module("epubviewer/native")]
@@ -54,9 +54,9 @@ impl Epub {
     /// 整本书的单文档 HTML：所有章节按 spine 顺序拼好，脚本负责分页与
     /// 上报页码。图片等资源是 `epub://` 占位，用 `Epub.resource()` 换成
     /// `data:` URL 再填回页面。
-    pub async fn book() -> Result<String, String> {
+    pub async fn book(theme: epub::BookTheme) -> Result<String, String> {
         let loaded = current()?;
-        blocking(move || loaded.book_html())
+        blocking(move || loaded.book_html(&theme))
             .await
             .map_err(|e| format!("排版失败: {e}"))
     }

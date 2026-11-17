@@ -1,8 +1,13 @@
 # ePubViewer
 
-A TSX app with a Rust crate of its own: `App.tsx` is the app, and the directory is also a crate (`Cargo.toml`,
-`src/lib.rs`; `nsh.json` `"rust": "."`) whose `#[native_module("epubviewer/native")]` exports a component (`Badge`), a
-module (`Format`) and a class (`Counter`) that `App.tsx` imports from `epubviewer/native`.
+A TSX app with a Rust crate of its own. `App.tsx` is the compositor; the reader's UI lives in `pages/` and
+`components/`, its state and commands in `store.ts`. The directory is also a crate (`Cargo.toml`, `src/lib.rs`;
+`nsh.json` `"rust": "."`) whose `#[native_module("epubviewer/native")]` exports the `Epub` module (`open`, `load`,
+`parse`, `book`, `resource`) that the app imports from `epubviewer/native`.
+
+`src/epub/` parses a EPUB (OPF, EPUB3 nav, EPUB2 NCX) and renders the whole book into a single HTML document —
+chapter anchors prefixed, cross-chapter links retargeted, images and media left as `epub://` placeholders that
+`Epub.resource()` turns into `data:` URLs.
 
 ```sh
 nsh run                      # this machine's backend; --target ios, android, web, macos, linux, windows or gpui
