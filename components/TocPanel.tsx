@@ -26,9 +26,10 @@ export function TocPanel(props: TocPanelProps) {
         style={{
           position: "absolute",
           top: 58,
+          // 跟着窗口高度伸缩：窗口最小高度也不至于把目录挤到屏幕外。
+          bottom: 58,
           right: 12,
           width: 320,
-          height: 600,
           flexDirection: "column",
           backgroundColor: token("popover"),
           borderRadius: token("radius"),

@@ -8,6 +8,24 @@
     "webview": {},
     "statusBar": true
   },
+  "window": {
+    "titleBar": {
+      "style": "hidden",
+      "height": 52,
+      "controlsOffset": {
+        "x": 20,
+        "y": 20
+      }
+    },
+    "defaultSize": {
+      "width": 960,
+      "height": 720
+    },
+    "minSize": {
+      "width": 640,
+      "height": 420
+    }
+  },
   "theme": {
     "cssVars": {
       "theme": {
