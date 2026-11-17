@@ -36,13 +36,13 @@ function pageHtml(body: string, stamp: number): string {
     font-size:18px; line-height:1.85; }
   #viewport { position:fixed; inset:44px 56px; overflow:hidden; }
   #content { height:100%; column-gap:0; column-fill:auto; transform:translateX(0); }
-  /* 兜底文本样式用 :where 降为 0 特异性，书籍自带 CSS 可直接覆盖 */
-  #content :where(p) { margin:0 0 1em; text-align:justify; }
-  #content :where(h1,h2,h3,h4,h5,h6) { line-height:1.4; margin:1.2em 0 .6em; }
+  /* 兜底文本样式整体放进 :where()（0 特异性），书籍 .calibreN 等类规则可直接覆盖 */
+  :where(#content p) { margin:0 0 1em; text-align:justify; }
+  :where(#content h1,#content h2,#content h3,#content h4,#content h5,#content h6) { line-height:1.4; margin:1.2em 0 .6em; }
   #content img { max-width:100%; height:auto; }
-  #content :where(a) { color:#8a6a3a; text-decoration:none; }
-  #content :where(blockquote) { margin:1em 0; padding-left:1em; border-left:3px solid #ddd8cc; }
-  #content :where(pre) { white-space:pre-wrap; }
+  :where(#content a) { color:#8a6a3a; text-decoration:none; }
+  :where(#content blockquote) { margin:1em 0; padding-left:1em; border-left:3px solid #ddd8cc; }
+  :where(#content pre) { white-space:pre-wrap; }
 </style></head><body>
 <div id="viewport"><div id="content">${body}</div></div>
 <!-- ${stamp} -->

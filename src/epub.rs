@@ -237,8 +237,12 @@ fn prepare_html<R: Read + Seek>(
     names: &[String],
     budget: &mut usize,
 ) -> String {
-    let body = extract_body(raw);
-    let body = strip_disallowed(&body);
+    let (body, class) = extract_body(raw);
+    let mut body = strip_disallowed(&body);
+    if !class.is_empty() {
+        // body 上的 class 在 WebView 里挂到内容容器，让书籍版式规则命中。
+        body = format!("<div class=\"{}\">{}</div>", escape_html(&class), body);
+    }
     inline_images(&body, &dir_of(chapter_path), archive, names, budget)
 }
 
@@ -292,14 +296,18 @@ fn collect_css<R: Read + Seek>(
     out
 }
 
-fn extract_body(s: &str) -> String {
+/// 取 `<body>` 内容，并保留 body 上的 class（书籍 CSS 常把版式挂在 body 上）。
+fn extract_body(s: &str) -> (String, String) {
     if let Some(start) = find_ci(s, "<body", 0) {
         if let Some(gt) = find_byte(s, b'>', start) {
             let end = find_ci(s, "</body", gt).unwrap_or(s.len());
-            return s[gt + 1..end].to_owned();
+            let class = attr_range(&s[start..gt + 1], "class")
+                .map(|(a, b)| s[start + a..start + b].to_owned())
+                .unwrap_or_default();
+            return (s[gt + 1..end].to_owned(), class);
         }
     }
-    s.to_owned()
+    (s.to_owned(), String::new())
 }
 
 /// 去掉脚本、外链样式等，正文里的 `<style>` 保留。
@@ -585,6 +593,7 @@ fn escape_html(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 fn resolve(base: &str, href: &str) -> String {
@@ -774,7 +783,7 @@ mod tests {
         add(
             &mut w,
             "OEBPS/ch1.xhtml",
-            r#"<html><head><link rel="stylesheet" href="style.css"/><style>.note { color: #666; }</style></head><body><h1>第一章</h1><p class="lead">你好，世界。</p><img src="images/cover.png" alt="封面"/><script>bad()</script></body></html>"#.as_bytes(),
+            r#"<html><head><link rel="stylesheet" href="style.css"/><style>.note { color: #666; }</style></head><body class="calibre2"><h1>第一章</h1><p class="lead">你好，世界。</p><img src="images/cover.png" alt="封面"/><script>bad()</script></body></html>"#.as_bytes(),
         );
         add(
             &mut w,
@@ -821,6 +830,8 @@ mod tests {
         assert!(html.contains("/* OEBPS/style.css */"));
         assert!(html.contains("font-weight: bold"));
         assert!(html.contains(".note { color: #666; }"));
+        // body 上的 class 保留到内容容器，书籍版式规则才能命中。
+        assert!(html.contains("<div class=\"calibre2\">"));
         assert!(loaded.chapter_html(1).contains("第二章正文"));
     }
 
