@@ -51,16 +51,32 @@ impl Epub {
         parse_bytes(bytes).await
     }
 
-    /// 取指定章节的正文 HTML；只传这一章，WebView 才装得下。
-    pub async fn chapter(index: u32) -> Result<String, String> {
-        let loaded = LOADED
-            .get()
-            .and_then(|lock| lock.lock().unwrap_or_else(|e| e.into_inner()).clone())
-            .ok_or_else(|| "还没有打开任何 EPUB".to_owned())?;
-        blocking(move || loaded.chapter_html(index))
+    /// 整本书的单文档 HTML：所有章节按 spine 顺序拼好，脚本负责分页与
+    /// 上报页码。图片等资源是 `epub://` 占位，用 `Epub.resource()` 换成
+    /// `data:` URL 再填回页面。
+    pub async fn book() -> Result<String, String> {
+        let loaded = current()?;
+        blocking(move || loaded.book_html())
             .await
-            .map_err(|e| format!("读取章节失败: {e}"))
+            .map_err(|e| format!("排版失败: {e}"))
     }
+
+    /// 把文档里的 `epub://OEBPS/images/a.png` 换成可直接当 `src` 用的
+    /// `data:` URL；EPUB 里没有这个条目时返回 null。
+    pub async fn resource(url: String) -> Result<Option<String>, String> {
+        let loaded = current()?;
+        blocking(move || loaded.resource(&url))
+            .await
+            .map_err(|e| format!("读取资源失败: {e}"))
+    }
+}
+
+/// 当前打开的书。
+fn current() -> Result<Arc<epub::Loaded>, String> {
+    LOADED
+        .get()
+        .and_then(|lock| lock.lock().unwrap_or_else(|e| e.into_inner()).clone())
+        .ok_or_else(|| "还没有打开任何 EPUB".to_owned())
 }
 
 async fn parse_at(path: PathBuf) -> Result<epub::Book, String> {

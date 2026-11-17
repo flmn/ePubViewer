@@ -5,129 +5,86 @@ import type { Book, TocEntry } from "epubviewer/native";
 
 type WebHandle = {
   injectJavaScript(script: string): void;
-  evaluate(script: string): Promise<{ value: unknown }>;
 };
-type Message = { type: string; total?: number; page?: number; href?: string };
-type Pending = { chapter: number; anchor: string } | null;
+type Asset = { id: string; url: string };
+type Message = {
+  type: string;
+  total?: number;
+  page?: number;
+  chapter?: number;
+  href?: string;
+  items?: Asset[];
+};
 
 let web: WebHandle | null = null;
+// 已经处理过 ready 的文档戳，避免重复跳转。
 let reportedFor = -1;
 let docStamp = 0;
+
+const WELCOME = `<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  html,body { margin:0; height:100%; background:#fffdf8; color:#2c2a26;
+    font-family:-apple-system,"PingFang SC","Songti SC",serif; font-size:16px; line-height:1.8; }
+  main { padding:56px; }
+  h1 { font-size:20px; margin:0 0 12px; }
+  p { margin:0 0 8px; color:#5a5851; }
+</style></head><body><main>
+<h1>ePubViewer</h1>
+<p>点左上角「打开 EPUB」，或把 .epub 文件拖到窗口里。</p>
+<p>← / →、空格翻页，右上角目录可跳到任意章节。</p>
+</main></body></html>`;
+
+// 整本书是一份文档：分页、页码、当前章都由页内脚本算好后上报。
 const book = signal<Book | null>(null);
-// 只保存当前这一章的正文：每次加载给一个新 stamp，强制 WebView 重新排版。
-const chapterDoc = signal<{ html: string; stamp: number }>({ html: "", stamp: 0 });
+const doc = signal<{ html: string; stamp: number }>({ html: "", stamp: 0 });
 const chapterIndex = signal(0);
 const page = signal(0);
 const totalPages = signal(1);
 const showToc = signal(false);
 const busy = signal(false);
 const error = signal<string | null>(null);
-const pending = signal<Pending>(null);
+// 文档还没排版好就先记下要跳的锚点，ready 之后再执行。
+const pendingAnchor = signal<string | null>(null);
 
-// 把章节 HTML 包成「一页一张纸」：CSS 多列把整章排成若干列，
-// 每列正好一页，translateX 切到第 n 列。页数由页内脚本算好后上报。
-function pageHtml(body: string, stamp: number): string {
-  return `<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-  html,body { margin:0; padding:0; height:100%; overflow:hidden;
-    background:#fffdf8; color:#2c2a26;
-    font-family:-apple-system,"PingFang SC","Songti SC",serif;
-    font-size:18px; line-height:1.85; }
-  #viewport { position:fixed; inset:44px 56px; overflow:hidden; }
-  #content { height:100%; column-gap:0; column-fill:auto; transform:translateX(0); }
-  /* 兜底文本样式整体放进 :where()（0 特异性），书籍 .calibreN 等类规则可直接覆盖 */
-  :where(#content p) { margin:0 0 1em; text-align:justify; }
-  :where(#content h1,#content h2,#content h3,#content h4,#content h5,#content h6) { line-height:1.4; margin:1.2em 0 .6em; }
-  #content img { max-width:100%; height:auto; }
-  :where(#content a) { color:#8a6a3a; text-decoration:none; }
-  :where(#content blockquote) { margin:1em 0; padding-left:1em; border-left:3px solid #ddd8cc; }
-  :where(#content pre) { white-space:pre-wrap; }
-</style></head><body>
-<div id="viewport"><div id="content">${body}</div></div>
-<!-- ${stamp} -->
-<script>
-(function(){
-  var viewport=document.getElementById('viewport');
-  var content=document.getElementById('content');
-  var width=1,total=1,current=0;
-  var lastPost='';
-  function post(msg){
-    if(!window.nsh||!window.nsh.postMessage) return;
-    var s=JSON.stringify(msg);
-    if(s===lastPost) return;
-    lastPost=s;
-    window.nsh.postMessage(s);
-  }
-  function setPage(n,report){
-    current=Math.max(0,Math.min(n,total-1));
-    content.style.transform='translateX('+(-current*width)+'px)';
-    if(report) post({type:'page',page:current,total:total});
-  }
-  function layout(){
-    width=Math.max(1,viewport.clientWidth);
-    content.style.width=width+'px';
-    content.style.columnWidth=width+'px';
-    content.style.height=viewport.clientHeight+'px';
-    total=Math.max(1,Math.ceil((content.scrollWidth-1)/width));
-    if(current>total-1) current=total-1;
-    setPage(current,false);
-    post({type:'ready',total:total,page:current});
-  }
-  window.__epubSetPage=function(n){ setPage(n,true); };
-  window.__epubReport=function(){ return {total:total,page:current}; };
-  window.__epubLayout=layout;
-  window.__epubGoToAnchor=function(id){
-    if(!id){ setPage(0,true); return; }
-    var el=document.getElementById(id)||document.querySelector('[name="'+id+'"]');
-    var rect=el&&el.getClientRects()[0];
-    if(!rect){ setPage(0,true); return; }
-    var left=rect.left-viewport.getBoundingClientRect().left+current*width;
-    setPage(Math.floor(left/width),true);
-  };
-  document.addEventListener('click',function(e){
-    var a=e.target&&e.target.closest?e.target.closest('a'):null;
-    if(!a) return;
-    e.preventDefault();
-    post({type:'link',href:a.getAttribute('href')||''});
-  });
-  window.addEventListener('resize',layout);
-  window.addEventListener('load',function(){ setTimeout(layout,0); });
-  var imgs=content.querySelectorAll('img');
-  for(var i=0;i<imgs.length;i++) imgs[i].addEventListener('load',layout);
-  setTimeout(layout,0);
-})();
-</script></body></html>`;
-}
-
-function welcomeHtml(): string {
-  return pageHtml(
-    '<h1>ePubViewer</h1><p>点左上角「打开 EPUB」，或把 .epub 文件拖到窗口里。</p>' +
-      '<p>← / →、空格翻页，左侧目录可跳转到任意章节。</p>',
-    0,
-  );
+function ready(): boolean {
+  return doc().stamp !== 0 && reportedFor === doc().stamp;
 }
 
 function chapter() {
   return book()?.chapters[chapterIndex()];
 }
 
-async function loadChapter(index: number) {
+async function loadBook(next: Book) {
+  book.set(next);
+  chapterIndex.set(0);
+  page.set(0);
+  totalPages.set(1);
+  reportedFor = -1;
+  pendingAnchor.set(null);
   try {
-    const html = await Epub.chapter(index);
-    chapterDoc.set({ html, stamp: ++docStamp });
+    const html = await Epub.book();
+    doc.set({ html, stamp: ++docStamp });
   } catch (e) {
     error.set(String(e));
   }
 }
 
-function adopt(next: Book) {
-  book.set(next);
-  chapterIndex.set(0);
-  page.set(0);
-  totalPages.set(1);
-  pending.set({ chapter: 0, anchor: "" });
-  void loadChapter(0);
+/// 宿主把 `epub://` 换成 data: URL，再让页内脚本填回原属性。
+async function hydrate(items: Asset[], stamp: number) {
+  for (const item of items) {
+    if (doc().stamp !== stamp) return;
+    let data: string | null = null;
+    try {
+      data = await Epub.resource(item.url);
+    } catch {
+      continue;
+    }
+    if (!data || doc().stamp !== stamp) continue;
+    web?.injectJavaScript(
+      `window.__epubRes && window.__epubRes(${JSON.stringify(item.id)}, ${JSON.stringify(data)})`,
+    );
+  }
 }
 
 async function openBook() {
@@ -135,7 +92,7 @@ async function openBook() {
   error.set(null);
   try {
     const picked = await Epub.open();
-    if (picked) adopt(picked);
+    if (picked) await loadBook(picked);
   } catch (e) {
     error.set(String(e));
   } finally {
@@ -147,7 +104,7 @@ async function openDropped(uri: string) {
   busy.set(true);
   error.set(null);
   try {
-    adopt(await Epub.load(uri));
+    await loadBook(await Epub.load(uri));
   } catch (e) {
     error.set(String(e));
   } finally {
@@ -162,35 +119,24 @@ function go(n: number) {
   web?.injectJavaScript(`window.__epubSetPage && window.__epubSetPage(${clamped})`);
 }
 
-function jump(entry: TocEntry) {
-  showToc.set(false);
-  chapterIndex.set(entry.chapter);
-  page.set(0);
-  pending.set({ chapter: entry.chapter, anchor: entry.anchor });
-  void loadChapter(entry.chapter);
+function turn(delta: number) {
+  if (!book() || !ready()) return;
+  go(page() + delta);
 }
 
-function jumpHref(href: string) {
-  if (!href || href.startsWith("http")) return;
-  if (href.startsWith("#")) {
-    web?.injectJavaScript(
-      `window.__epubGoToAnchor && window.__epubGoToAnchor(${JSON.stringify(href.slice(1))})`,
-    );
+/// 目录项 → 文档内锚点：章节开头是 `ch{i}`，章内锚点是 `ch{i}-{anchor}`。
+function jump(entry: TocEntry) {
+  showToc.set(false);
+  if (!book()) return;
+  chapterIndex.set(entry.chapter);
+  const anchor = entry.anchor ? `ch${entry.chapter}-${entry.anchor}` : `ch${entry.chapter}`;
+  if (!ready()) {
+    pendingAnchor.set(anchor);
     return;
   }
-  const [rawFile, anchor = ""] = href.split("#");
-  const file = decodeURIComponent(rawFile);
-  const tail = file.split("/").pop() ?? file;
-  const current = book();
-  if (!current) return;
-  const index = current.chapters.findIndex(
-    (c) => c.id === file || c.id === tail || c.id.endsWith("/" + tail),
+  web?.injectJavaScript(
+    `window.__epubGoToAnchor && window.__epubGoToAnchor(${JSON.stringify(anchor)})`,
   );
-  if (index < 0) return;
-  chapterIndex.set(index);
-  page.set(0);
-  pending.set({ chapter: index, anchor });
-  void loadChapter(index);
 }
 
 function onMessage(data: string) {
@@ -202,34 +148,35 @@ function onMessage(data: string) {
   }
   if (msg.type === "ready") {
     totalPages.set(Math.max(1, msg.total ?? 1));
-    const stamp = chapterDoc().stamp;
+    page.set(msg.page ?? 0);
+    chapterIndex.set(msg.chapter ?? 0);
+    const stamp = doc().stamp;
     if (reportedFor === stamp) return;
     reportedFor = stamp;
-    const target = pending();
-    pending.set(null);
-    if (target && target.anchor) {
+    const anchor = pendingAnchor();
+    pendingAnchor.set(null);
+    if (anchor) {
       web?.injectJavaScript(
-        `window.__epubGoToAnchor && window.__epubGoToAnchor(${JSON.stringify(target.anchor)})`,
+        `window.__epubGoToAnchor && window.__epubGoToAnchor(${JSON.stringify(anchor)})`,
       );
-    } else {
-      go(page());
     }
   } else if (msg.type === "page") {
     totalPages.set(Math.max(1, msg.total ?? totalPages()));
     page.set(msg.page ?? 0);
-  } else if (msg.type === "link") {
-    jumpHref(msg.href ?? "");
+    chapterIndex.set(msg.chapter ?? chapterIndex());
+  } else if (msg.type === "res") {
+    void hydrate(msg.items ?? [], doc().stamp);
   }
 }
 
 function App() {
   keymap.bind(
     {
-      left: () => go(page() - 1),
-      right: () => go(page() + 1),
-      space: () => go(page() + 1),
-      pageup: () => go(page() - 1),
-      pagedown: () => go(page() + 1),
+      left: () => turn(-1),
+      right: () => turn(1),
+      space: () => turn(1),
+      pageup: () => turn(-1),
+      pagedown: () => turn(1),
       "mod+o": () => void openBook(),
       "mod+t": () => {
         if (book()) showToc.update((v) => !v);
@@ -298,37 +245,31 @@ function App() {
         </View>
 
         <View style={{ flex: 1, padding: 22 }}>
-          <View style={{ flex: 1, backgroundColor: "#fffdf8", borderRadius: 6 }}>
+          <View
+            style={{ flex: 1, backgroundColor: "#fffdf8", borderRadius: 6 }}
+          >
             <WebView
               ref={(node) => {
                 web = node;
               }}
-              html={
-                chapterDoc().html
-                  ? pageHtml(chapterDoc().html, chapterDoc().stamp)
-                  : welcomeHtml()
-              }
+              html={doc().html || WELCOME}
               scrollable={false}
               style={{ flex: 1 }}
               onLoad={() => {
-                web?.injectJavaScript("window.__epubLayout && window.__epubLayout();");
-                web
-                  ?.evaluate("window.__epubReport ? window.__epubReport() : null")
-                  .then((result) => {
-                    const value = result.value as { total?: number; page?: number } | null;
-                    if (value) onMessage(JSON.stringify({ type: "ready", ...value }));
-                  })
-                  .catch(() => {});
+                // 页面脚本的首次投递可能早于宿主接上，这里再要一次资源。
+                web?.injectJavaScript(
+                  "(window.__epubRequestAssets && window.__epubRequestAssets(true),window.__epubLayout && window.__epubLayout());",
+                );
               }}
               onMessage={(e) => onMessage(e.data)}
               onError={(e) => error.set(e.message)}
             />
             <View
-              onPress={() => go(page() - 1)}
+              onPress={() => turn(-1)}
               style={{ position: "absolute", left: 0, top: 0, width: 56, height: "100%" }}
             />
             <View
-              onPress={() => go(page() + 1)}
+              onPress={() => turn(1)}
               style={{ position: "absolute", right: 0, top: 0, width: 56, height: "100%" }}
             />
           </View>
@@ -346,18 +287,15 @@ function App() {
             backgroundColor: "#f7f6f2",
           }}
         >
-          <Button onPress={() => go(page() - 1)} style={{ padding: 8 }}>
+          <Button onPress={() => turn(-1)} style={{ padding: 8 }}>
             <Text style={{ fontSize: 13, color: "#5a5851" }}>‹ 上一页</Text>
           </Button>
           <Text style={{ fontSize: 13, color: "#3b3a35" }}>
-            {page() + 1} / {totalPages()}
+            {`${page() + 1} / ${totalPages()}`}
           </Text>
-          <Button onPress={() => go(page() + 1)} style={{ padding: 8 }}>
+          <Button onPress={() => turn(1)} style={{ padding: 8 }}>
             <Text style={{ fontSize: 13, color: "#5a5851" }}>下一页 ›</Text>
           </Button>
-          <Text style={{ fontSize: 12, color: "#8a887f" }}>
-            {book() ? `${chapterIndex() + 1} / ${book()!.chapters.length} 章` : ""}
-          </Text>
         </View>
       </View>
 
