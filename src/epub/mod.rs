@@ -550,11 +550,17 @@ mod tests {
         assert!(html.contains("__epubSetPage"));
         assert!(html.contains("__epubLayout"));
         assert!(html.contains("__epubSpread"));
-        // 触控板/滚轮手势与翻页过渡。`will-change` 跟着一起掉了的话，
-        // 翻页会退化成每帧重绘几千列（对开时实测 60fps → 12fps）。
+        // 触控板/滚轮手势与翻页平移。翻页是直接把整块平移到位，
+        // **不能**加 CSS 过渡：整块几千列宽，一交给浏览器做动画，它会
+        // 每帧重画整块，大书一次翻页能卡住好几秒。
         assert!(html.contains("addEventListener('wheel'"));
-        assert!(html.contains("transition:transform"));
-        assert!(html.contains("will-change:transform"));
+        assert!(html.contains("translateX("));
+        assert!(!html.contains("transition:transform"));
+        // 缩放/切单双页后按记住的那个字回到原处，不能跳回首页。
+        assert!(html.contains("caretRangeFromPoint"));
+        assert!(html.contains("getClientRects"));
+        // NBSP 连起来的长书名不能顶破栏宽漏到下一页。
+        assert!(html.contains("overflow-wrap:anywhere"));
     }
 
     #[test]

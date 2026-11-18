@@ -153,13 +153,15 @@ const BOOK_STYLE: &str = r#"</title><style>
     font-family:-apple-system,"PingFang SC","Songti SC",serif;
     font-size:var(--font-size,18px); line-height:1.85; }
   #viewport { position:fixed; inset:44px 56px; overflow:hidden; }
-  /* 翻页靠平移 #content：给 transform 加过渡就成了滑动翻页。
-     will-change 不能省：全书是几千列宽的一整块，不提升成合成层的话，
-     每帧都要重绘这块上千列的内容——对开时实测掉到 12fps，加上就回到 60fps。 */
+  /* 翻页就是把 #content 平移一屏，注意这里**不能加 transition**：
+     整块是几千列宽的一张画，一交给浏览器做动画，它会把整块分层重画，
+     大书一次翻页能卡住好几秒（实测 60fps 掉到 3 帧 / 12 秒）。
+     直接落位只要 3–7ms。 */
   #content { position:relative; height:100%; column-gap:0; column-fill:auto;
-    transform:translateX(0); will-change:transform;
-    transition:transform 200ms cubic-bezier(.22,.61,.36,1); }
-  @media (prefers-reduced-motion: reduce) { #content { transition:none; } }
+    transform:translateX(0);
+    /* 书里常把英文书名/网址用 NBSP 连成一整块，栏宽不够时整块顶破栏宽，
+       末尾的字漏进中缝甚至下一页；允许必要时在任意位置断行。 */
+    overflow-wrap:anywhere; }
   .epub-chapter { display:block; }
   /* 兜底文本样式整体放进 :where()（0 特异性），书籍的 .calibreN 等类规则可直接覆盖 */
   :where(#content p) { margin:0 0 1em; text-align:justify; }
@@ -225,27 +227,30 @@ const BOOK_SCRIPT: &str = r#"</div></div>
     }
     return best;
   }
-  /* `animate` 为 false 时不播过渡：跳章、换排版这类大跨度位移直接落位，
-     只有相邻翻页才滑动。 */
-  function setPage(n,report,animate){
+  /* 翻一屏：直接把 #content 平移到位，不播过渡（见 CSS 里的说明）。
+     平移是纯视觉位移，不动排版，实测 3–7ms 就能完成。 */
+  function setPage(n,report){
     current=Math.max(0,Math.min(n,total-1));
-    var still=animate===false;
-    if(still) content.style.transition='none';
     content.style.transform='translateX('+(-current*stride()*per())+'px)';
-    if(still){ void content.offsetWidth; content.style.transition=''; }
     if(report){
       post({type:'page',page:current*per(),total:columns,chapter:chapterAt(current*stride()*per())});
     }
   }
-  /* 换列宽之前记住读者正看着的那一行（页面左上角下的元素），
-     重排后再按它定位，单页/对开切换与窗口缩放都不会跳走。 */
+  /* 重排前记住读者正看着的那一个字（文本节点 + 偏移），而不是块元素：
+     块元素往往横跨好几列，getBoundingClientRect 给的是所有碎片的并集，
+     拿它算当前页就会得到 0，一缩放就跳回首页。 */
   function anchorAt(){
     if(!document.caretRangeFromPoint) return null;
     var box=viewport.getBoundingClientRect();
-    var range=document.caretRangeFromPoint(box.left+4,box.top+4);
-    var node=range&&range.startContainer;
-    var el=node?(node.nodeType===1?node:node.parentElement):null;
-    return el&&content.contains(el)?el:null;
+    /* 左上角 4pt 常落在行框之外，只拿到块元素；往里找几行。 */
+    for(var dy=8;dy<=96;dy+=12){
+      var range=document.caretRangeFromPoint(box.left+12,box.top+dy);
+      var node=range&&range.startContainer;
+      if(node&&node.nodeType===3&&content.contains(node)&&node.nodeValue.trim()){
+        return {node:node,offset:range.startOffset};
+      }
+    }
+    return null;
   }
   function layout(){
     var p=per();
@@ -262,18 +267,27 @@ const BOOK_SCRIPT: &str = r#"</div></div>
     total=Math.max(1,Math.ceil(columns/p));
     if(keep) current=Math.min(total-1,Math.floor(columnOf(keep)/p));
     if(current>total-1) current=total-1;
-    setPage(current,false,false);
+    setPage(current,false);
     post({type:'ready',total:columns,page:current*p,chapter:chapterAt(current*stride()*p)});
   }
-  /* 元素落在第几列（物理页）：量位置时先把 translateX 归零（过渡也停掉），
-     否则两侧都带着翻页位移，算出来的页码会跟着当前页漂。 */
-  function columnOf(el){
-    var t=content.style.transform,tr=content.style.transition;
-    content.style.transition='none';
+  /* 落在第几列（物理页）：量位置时先把 translateX 归零，否则翻页位移会
+     把算出来的页码带着漂。锚点是字符时只量那一个字，避免跨列的大块
+     元素把整段并集的左边缘（第 0 列）当成当前位置。 */
+  function columnOf(target){
+    var t=content.style.transform;
     content.style.transform='translateX(0)';
-    var left=el.getBoundingClientRect().left-content.getBoundingClientRect().left;
+    var rect;
+    if(target.node){
+      var node=target.node,off=Math.min(target.offset,Math.max(0,node.nodeValue.length-1));
+      var range=document.createRange();
+      range.setStart(node,off);
+      range.setEnd(node,off+1);
+      rect=range.getClientRects()[0];
+    }else{
+      rect=target.getClientRects()[0]||target.getBoundingClientRect();
+    }
+    var left=rect?rect.left-content.getBoundingClientRect().left:0;
     content.style.transform=t;
-    content.style.transition=tr;
     return Math.max(0,Math.floor(left/stride()));
   }
   /* 找不到锚点时退到它所属的章（`ch3-x` → 第 3 章开头）。Calibre 这类
@@ -284,20 +298,18 @@ const BOOK_SCRIPT: &str = r#"</div></div>
     if(!el){
       var m=/^ch(\d+)/.exec(id||'');
       el=m?sections[+m[1]]:null;
-      if(!el){ setPage(0,true,false); return; }
+      if(!el){ setPage(0,true); return; }
     }
-    setPage(Math.floor(columnOf(el)/per()),true,false);
+    setPage(Math.floor(columnOf(el)/per()),true);
   }
-  /* 宿主翻屏：`delta` 是屏数（对开时一屏两页）。相邻一屏才滑动，
-     跨多屏（跳进度）直接落位。 */
+  /* 宿主翻屏：`delta` 是屏数（对开时一屏两页）。 */
   window.__epubTurn=function(delta){
     if(!delta) return;
-    setPage(current+delta,true,true);
+    setPage(current+delta,true);
   };
   /* 宿主指定物理页：落到它所在的那一屏 */
   window.__epubSetPage=function(n){
-    var next=Math.max(0,Math.min(Math.floor(n/per()),total-1));
-    setPage(next,true,Math.abs(next-current)===1);
+    setPage(Math.floor(n/per()),true);
   };
   window.__epubLayout=layout;
   window.__epubGoToAnchor=goAnchor;
@@ -311,7 +323,7 @@ const BOOK_SCRIPT: &str = r#"</div></div>
   window.__epubGoToChapter=function(i){
     var el=sections[i];
     if(!el) return;
-    setPage(Math.floor(columnOf(el)/per()),true,false);
+    setPage(Math.floor(columnOf(el)/per()),true);
   };
   /* 宿主把 epub:// 换成 data: URL 后填回原属性 */
   window.__epubRes=function(id,data){
