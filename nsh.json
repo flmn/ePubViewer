@@ -1,6 +1,14 @@
 {
   "name": "ePubViewer",
   "icon": "assets/icon.png",
+  "fileTypes": [
+    {
+      "name": "EPUB 电子书",
+      "extensions": ["epub"],
+      "contentTypes": ["org.idpf.epub-container"],
+      "role": "viewer"
+    }
+  ],
   "id": "dev.paicode.epubviewer",
   "version": "1.0.0",
   "build": 1,
