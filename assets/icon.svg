@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <rect width="1024" height="1024" fill="#172631"/>
+
+  <g transform="translate(512 540) scale(1.14) translate(-512 -540)">
+    <!-- 书下面的一点暗影，让整本书从背景里浮出来 -->
+    <path d="M150 746 L512 812 L874 746 L874 786 L512 852 L150 786 Z" fill="#0F1B24"/>
+
+    <!-- 左页 -->
+    <path d="M146 268
+             C 300 244, 410 278, 500 318
+             L 500 792
+             C 400 748, 290 718, 146 742
+             Z"
+          fill="#F7F1E4"/>
+    <!-- 右页 -->
+    <path d="M524 318
+             C 614 278, 724 244, 878 268
+             L 878 742
+             C 734 718, 624 748, 524 792
+             Z"
+          fill="#EDE5D4"/>
+
+    <!-- 书脊 -->
+    <path d="M500 318 L512 310 L524 318 L524 792 L512 800 L500 792 Z" fill="#B9AE99"/>
+
+    <!-- 页面上的字行：只留三条，缩到小尺寸也不会糊 -->
+    <g fill="#B9AE99">
+      <rect x="210" y="390" width="218" height="14" rx="7"/>
+      <rect x="210" y="446" width="218" height="14" rx="7"/>
+      <rect x="210" y="502" width="150" height="14" rx="7"/>
+      <rect x="596" y="390" width="218" height="14" rx="7"/>
+      <rect x="596" y="446" width="218" height="14" rx="7"/>
+      <rect x="596" y="502" width="150" height="14" rx="7"/>
+    </g>
+
+    <!-- 书签 -->
+    <path d="M482 292 L542 292 L542 708 L512 668 L482 708 Z" fill="#E5A13C"/>
+  </g>
+</svg>
