@@ -596,6 +596,10 @@ mod tests {
         assert!(html.contains("id=\"ch1\""));
         assert!(html.contains("第一章"));
         assert!(html.contains("第二章正文"));
+        // 每章强制另起新页（多列布局里一列即一页），首页不额外断列，
+        // 否则章节会紧贴上一章结尾、或第一页前多出空白页。
+        assert!(html.contains("#content section.epub-chapter { display:block; break-before:column; }"));
+        assert!(html.contains("#content section.epub-chapter:first-child { break-before:auto; }"));
         // &amp;nbsp; 还原成 &nbsp;，交给浏览器解码为空格。
         assert!(html.contains("你好，世界。&nbsp;测试"));
         assert!(!html.contains("&amp;nbsp;"));

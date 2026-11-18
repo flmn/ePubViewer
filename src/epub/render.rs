@@ -162,7 +162,11 @@ const BOOK_STYLE: &str = r#"</title><style>
     /* 书里常把英文书名/网址用 NBSP 连成一整块，栏宽不够时整块顶破栏宽，
        末尾的字漏进中缝甚至下一页；允许必要时在任意位置断行。 */
     overflow-wrap:anywhere; }
-  .epub-chapter { display:block; }
+  /* 每个 EPUB 文档（一章）从新的一页开始：多列布局里一列就是一页。
+     之前只有封面设了 break-before，普通章节会紧贴上一章结尾。 */
+  #content section.epub-chapter { display:block; break-before:column; }
+  /* 全书第一个 section 不往前断列，否则第一页前会多出一张空白页 */
+  #content section.epub-chapter:first-child { break-before:auto; }
   /* 兜底文本样式整体放进 :where()（0 特异性），书籍的 .calibreN 等类规则可直接覆盖 */
   :where(#content p) { margin:0 0 1em; text-align:justify; }
   :where(#content h1,#content h2,#content h3,#content h4,#content h5,#content h6) { line-height:1.4; margin:1.2em 0 .6em; }
@@ -170,11 +174,13 @@ const BOOK_STYLE: &str = r#"</title><style>
   #content img { max-width:100%; max-height:var(--page-height,100%); height:auto;
     object-fit:contain; break-inside:avoid; }
   :where(#content figure,#content table,#content pre) { break-inside:avoid; }
-  /* 封面单独占一整页：整图缩到一页之内，前后都另起一页。
+  /* 封面单独占一整页：整图缩到一页之内。前一章/后一章的 break-before
+     已经保证封面前后各起新页，这里不再写 break-after，免得同一分界上
+     两个强制断列在 WebView 里多出一张空白页。
      这里不能用 flex：封面的包裹层会变成收缩宽度，svg 的 100% 宽度
      跟着塌成 0，封面就整张消失了。 */
   #content section.epub-cover { display:block; height:var(--page-height,100%);
-    text-align:center; break-before:column; break-after:column; break-inside:avoid; }
+    text-align:center; break-before:column; break-inside:avoid; }
   /* 封面就是第一页时不要再往前断一列，否则多出一张空白页 */
   #content section.epub-cover:first-child { break-before:auto; }
   /* 封面外层的边距要抹掉：图片已经卡满一页，再带 margin 就会被切掉边缘 */
