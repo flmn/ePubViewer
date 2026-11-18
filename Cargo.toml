@@ -7,8 +7,8 @@ publish = false
 [workspace]
 
 [dependencies]
-nsh-core = "0.5"
-nsh-base = "0.5"
+nsh-core = "0.6"
+nsh-base = "0.6"
 zip = "9"
 roxmltree = "0.21"
 encoding_rs = "0.8"
